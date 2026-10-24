@@ -1,0 +1,125 @@
+
+name: Spring Petclinic CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-scan-publish:
+    name: Build, Test, Scan and Publish
+    runs-on: self-hosted
+    timeout-minutes: 30
+
+    env:
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+      NEXUS_REGISTRY: ${{ secrets.NEXUS_REGISTRY }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Verify required tools
+        run: |
+          java -version
+          ./mvnw -version
+          sudo docker --version
+          curl --version
+
+      - name: Unit tests
+        run: ./mvnw -B clean test
+
+      - name: Package application
+        run: ./mvnw -B package -DskipTests
+
+      - name: SonarQube analysis
+        run: |
+          test -n "$SONAR_TOKEN"
+          test -n "$SONAR_HOST_URL"
+          ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.projectKey=Petclinic-DevOps-Scan \
+            -Dsonar.host.url="$SONAR_HOST_URL" \
+            -Dsonar.token="$SONAR_TOKEN"
+
+      - name: Start application for functional tests
+        run: |
+          nohup java -jar target/spring-petclinic-4.0.0-SNAPSHOT.jar \
+            --server.port=18080 \
+            > /tmp/spring-petclinic-test.log 2>&1 &
+          echo $! > /tmp/spring-petclinic-test.pid
+
+          for i in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18080/ \
+              -o /dev/null; then
+              echo "Petclinic is responding."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat /tmp/spring-petclinic-test.log
+          exit 1
+
+      - name: Functional smoke test
+        run: |
+          status=$(curl --silent --output /dev/null \
+            --write-out '%{http_code}' \
+            http://127.0.0.1:18080/)
+          echo "Home page HTTP status: $status"
+          test "$status" = "200"
+
+      - name: Install performance test tool
+        run: |
+          if ! command -v ab >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y apache2-utils
+          fi
+
+      - name: Performance smoke test
+        run: |
+          ab -n 100 -c 10 http://127.0.0.1:18080/
+
+      - name: Stop test application
+        if: always()
+        run: |
+          if [ -f /tmp/spring-petclinic-test.pid ]; then
+            kill "$(cat /tmp/spring-petclinic-test.pid)" || true
+            rm -f /tmp/spring-petclinic-test.pid
+          fi
+
+      - name: Build Docker image
+        run: |
+          sudo docker build \
+            -t "$NEXUS_REGISTRY/spring-petclinic:$GITHUB_SHA" \
+            -t "$NEXUS_REGISTRY/spring-petclinic:latest" .
+
+      - name: Log in to Nexus
+        run: |
+          printf '%s' "$NEXUS_PASSWORD" |
+            sudo docker login "$NEXUS_REGISTRY" \
+              --username "$NEXUS_USERNAME" \
+              --password-stdin
+
+      - name: Push Docker image to Nexus
+        run: |
+          sudo docker push "$NEXUS_REGISTRY/spring-petclinic:$GITHUB_SHA"
+          sudo docker push "$NEXUS_REGISTRY/spring-petclinic:latest"
+
+      - name: Log out from Nexus
+        if: always()
+        run: sudo docker logout "$NEXUS_REGISTRY" || true
